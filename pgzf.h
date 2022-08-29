@@ -9,7 +9,7 @@
 
 #define PGZF_DEFAULT_BUFF_SIZE	(1U << 20) // 1MB
 #define PGZF_MAX_BUFF_SIZE	(1LLU << 32)
-#define PGZF_BEG_HEAD_SIZE	28
+#define PGZF_BEG_HEAD_SIZE	32
 #define PGZF_BEG_HEAD_GC_OFFSET	24
 #define PGZF_DAT_HEAD_SIZE	20
 #define PGZF_IDX_HEAD_SIZE	24
@@ -38,13 +38,13 @@ struct PGZF;
 
 thread_beg_def(pgz);
 struct PGZF *pz;
-u4i zcval, gcval, ixoff, soff;
-u8i doff;
+u4i zcval, ixoff, soff;
+u8i doff, gcval, fileoff;
 u2i ixval;
 u1v *dst, *src;
 u4i token;
 int level;
-int task, has, blocktype;
+int task, eof, has, blocktype;
 thread_end_def(pgz);
 
 typedef struct PGZF {
@@ -52,7 +52,7 @@ typedef struct PGZF {
 	int rw_mode, seekable, ftype;
 	u4i bufsize; // MUST be multiple of 1MB
 	u4i grp_blocks; // 8000
-	u8v *blocks[2];
+	u8v *blocks[2], *sels;
 	u8i tot_in, tot_out, lst_in, lst_out, lst_off;
 	u1v **dsts, **srcs, *tmp;
 	z_stream *z;
@@ -61,7 +61,7 @@ typedef struct PGZF {
 	thread_def_shared_vars(pgz);
 	int grp_status;
 	int step; // used in decompress gzip file
-	int eof, error;
+	int error;
 	int verbose;
 } PGZF;
 
@@ -88,7 +88,7 @@ static inline u8i _bytes2num_pgzf(u1i *bs, u1i bl){
  */
 
 
-static inline u4i _gen_beg_pgzf_header(u1i bs[28], u4i zsize, u4i gzsize){
+static inline u4i _gen_beg_pgzf_header(u1i bs[32], u4i zsize, u8i gzsize){
 	bs[0] = 0x1f; // GZIP ID1
 	bs[1] = 0x8b; // GZIP ID2
 	bs[2] = 8; // CM = deflate
@@ -99,7 +99,7 @@ static inline u4i _gen_beg_pgzf_header(u1i bs[28], u4i zsize, u4i gzsize){
 	bs[7] = 0; // MTIME
 	bs[8] = 0b10101010; // XFL, indicating pgzf
 	bs[9] = 3; // OS = unix
-	_num2bytes_pgzf(bs + 10, 2, 16); // XLEN
+	_num2bytes_pgzf(bs + 10, 2, 4 + 4 + 4 + 8); // XLEN
 	bs[12] = 'Z'; // TAG ZC: compressed block size
 	bs[13] = 'C';
 	_num2bytes_pgzf(bs + 14, 2, 4); // TAG LEN
@@ -107,12 +107,12 @@ static inline u4i _gen_beg_pgzf_header(u1i bs[28], u4i zsize, u4i gzsize){
 	// gzsize will be updated after group end
 	bs[20] = 'G'; // TAG GC: group compressed block size
 	bs[21] = 'C';
-	_num2bytes_pgzf(bs + 22, 2, 4); // TAG LEN
-	_num2bytes_pgzf(bs + 24, 4, gzsize);
-	return 28;
+	_num2bytes_pgzf(bs + 22, 2, 8); // TAG LEN
+	_num2bytes_pgzf(bs + 24, 8, gzsize);
+	return 32;
 }
 
-static inline u4i _gen_dat_pgzf_header(u1i bs[28], u4i zsize){
+static inline u4i _gen_dat_pgzf_header(u1i bs[32], u4i zsize){
 	bs[0] = 0x1f; // GZIP ID1
 	bs[1] = 0x8b; // GZIP ID2
 	bs[2] = 8; // CM = deflate
@@ -131,7 +131,7 @@ static inline u4i _gen_dat_pgzf_header(u1i bs[28], u4i zsize){
 	return 20;
 }
 
-static inline u4i _gen_idx_pgzf_header(u1i bs[28], u4i zsize, u2i xcnt){
+static inline u4i _gen_idx_pgzf_header(u1i bs[32], u4i zsize, u2i xcnt){
 	bs[0] = 0x1f; // GZIP ID1
 	bs[1] = 0x8b; // GZIP ID2
 	bs[2] = 8; // CM = deflate
@@ -174,7 +174,7 @@ static inline u4i _zlib_raw_deflate_all(u1i *dst, u4i dlen, u1i *src, u4i slen, 
 	return ret;
 }
 
-static inline int _read_pgzf_header(FILE *in, u1v *src, u4i *hoff, u4i *zcval, u4i *gcval, u2i *ixval, u4i *ixoff){
+static inline int _read_pgzf_header(FILE *in, u1v *src, u4i *hoff, u4i *zcval, u8i *gcval, u2i *ixval, u4i *ixoff){
 	u4i off, val, sl, end;
 	int ch, is_pgzf, xflag;
 	char si1, si2;
@@ -221,9 +221,9 @@ static inline int _read_pgzf_header(FILE *in, u1v *src, u4i *hoff, u4i *zcval, u
 				sl = _bytes2num_pgzf(src->buffer + off + 2, 2);
 				off += 4;
 				if(si1 == 'Z' && si2 == 'C'){
-					if(zcval) zcval[0] = _bytes2num_pgzf(src->buffer + off, 4);
+					if(zcval) zcval[0] = _bytes2num_pgzf(src->buffer + off, sl);
 				} else if(si1 == 'G' && si2 == 'C'){
-					if(gcval) gcval[0] = _bytes2num_pgzf(src->buffer + off, 4);
+					if(gcval) gcval[0] = _bytes2num_pgzf(src->buffer + off, sl);
 				} else if(si1 == 'I' && si2 == 'X'){
 					if(ixval) ixval[0] = sl;
 					if(ixoff) ixoff[0] = off;
@@ -291,7 +291,7 @@ int pgzf_inflate_raw_core(z_stream *z, u1i *dst, u4i *dlen, u1i *src, u4i *slen,
 	return ret;
 }
 
-// src start just after gz_header, and include fz_tailer
+// src start just after gz_header, and include gz_tailer
 int pgzf_inflate_core(u1i *dst, u4i *dlen, u1i *src, u4i slen, int check){
 	z_stream Z, *z;
 	u4i soff, dsz;
@@ -396,6 +396,7 @@ if(pgz->task == PGZF_TASK_DEFLATE){
 	if(pz->verbose){
 		fflush(stdout); fprintf(stderr, " -- compressed block: type=%d id=%d src=%d dst=%d --\n", pgz->blocktype, pgz->token, (u4i)pgz->src->size, (u4i)pgz->dst->size); fflush(stderr);
 	}
+	pgz->fileoff = ftell(pz->file);
 	fwrite(pgz->dst->buffer, 1, pgz->dst->size, pz->file);
 	pz->tot_out += pgz->dst->size;
 	if(pgz->blocktype == PGZF_BLOCKTYPE_IDX){ // update BEG_HEADER
@@ -406,7 +407,7 @@ if(pgz->task == PGZF_TASK_DEFLATE){
 		encap_u1v(pgz->dst, 4);
 		_num2bytes_pgzf(pgz->dst->buffer, 4, zsize);
 		if(pz->verbose){
-			fflush(stdout); fprintf(stderr, " -- created compress group: offset=%lld,%lld length=%lld,%lld --\n", pz->lst_in, pz->lst_out, pz->tot_in - pz->lst_in, pz->tot_out - pz->lst_out); fflush(stderr);
+			fflush(stdout); fprintf(stderr, " -- created compress group: offset=%lld,%lld length=%lld,%lld --\n", pz->lst_in, pz->lst_out, pz->tot_in - pz->lst_in, pz->tot_out - pz->lst_out - pgz->dst->size); fflush(stderr);
 		}
 		fwrite(pgz->dst->buffer, 1, 4, pz->file);
 		fseek(pz->file, offset, SEEK_SET);
@@ -427,16 +428,38 @@ if(pgz->task == PGZF_TASK_DEFLATE){
 	while((pz->ridx % pz->ncpu) != UInt(pgz->t_idx)){
 		nano_sleep(10);
 		if(pz->error) break;
-		if(pz->eof) break;
+		if(pgz->eof == 2) break;
 	}
-	if(pz->error) break;
+	if((pgz->eof == 1 && pgz->soff >= pgz->src->size)){
+		pz->ridx ++;
+		break;
+	}
+	if(pz->error || pgz->eof == 2){
+		break;
+	}
 	if(pz->rw_mode == PGZF_MODE_R){
 		if(pgz->src->size){ // already loaded header
-		} else {
+		} else if(pgz->eof == 0){
 			pgz->soff = pgz->src->size = 0;
+			if(pz->sels->size){
+				u8i blkidx;
+				if(pz->ridx >= pz->sels->size){
+					pgz->eof = 1;
+					pz->ridx ++;
+					break;
+				}
+				blkidx = pz->sels->buffer[pz->ridx];
+				if(blkidx >= pz->blocks[0]->size){
+					pz->error = 1;
+					pz->ridx ++;
+					break;
+				}
+				fseek(pz->file, pz->blocks[0]->buffer[blkidx], SEEK_SET);
+			}
+			pgz->fileoff = ftell(pz->file);
 			ret = _read_pgzf_header(pz->file, pgz->src, &pgz->soff, &pgz->zcval, &pgz->gcval, &pgz->ixval, &pgz->ixoff);
 			if(pgz->src->size == 0){
-				pz->eof = 1;
+				pgz->eof = 1;
 				pz->ridx ++;
 				break;
 			}
@@ -460,7 +483,7 @@ if(pgz->task == PGZF_TASK_DEFLATE){
 		}
 		pgz->src->size += rsize;
 		pz->tot_in += rsize;
-		pz->ridx ++;
+		next = pz->ridx ++;
 		dsz = _bytes2num_pgzf(pgz->src->buffer + pgz->zcval - 4, 4);
 		encap_u1v(pgz->dst, dsz);
 		pgz->soff = 0;
@@ -470,6 +493,9 @@ if(pgz->task == PGZF_TASK_DEFLATE){
 			break;
 		}
 		pgz->dst->size = dsz;
+		if(pz->verbose){
+			fflush(stdout); fprintf(stderr, " -- decompressed block: id=%d src=%d dst=%d --\n", next, (u4i)pgz->src->size, (u4i)pgz->dst->size); fflush(stderr);
+		}
 		clear_u1v(pgz->src); pgz->soff = 0;
 	} else if(pz->rw_mode == PGZF_MODE_R_GZ){
 		u4i bsz;
@@ -480,11 +506,11 @@ if(pgz->task == PGZF_TASK_DEFLATE){
 			if(pgz->src->size == pgz->soff){
 				pgz->soff = pgz->src->size = 0;
 			}
-			if(pgz->src->size < bsz){
+			if(!pgz->eof && pgz->src->size < bsz){
 				encap_u1v(pgz->src, bsz - pgz->src->size);
 				rsize = fread(pgz->src->buffer + pgz->src->size, 1, bsz - pgz->src->size, pz->file);
 				if(rsize < bsz - pgz->src->size){
-					pz->eof = 1;
+					pgz->eof = 1;
 				}
 				pz->tot_in += rsize;
 				pgz->src->size += rsize;
@@ -498,9 +524,10 @@ if(pgz->task == PGZF_TASK_DEFLATE){
 				ret = _read_pgzf_header(pz->file, pgz->src, &pgz->soff, &pgz->zcval, &pgz->gcval, &pgz->ixval, &pgz->ixoff);
 				if(ret != PGZF_FILETYPE_GZ && ret != PGZF_FILETYPE_PGZF){
 					if(pgz->src->size == pgz->soff){
-						pz->eof = 1;
+						if(pgz->eof == 0) pgz->eof = 1;
 					} else {
 						fprintf(stderr, " -- failed in read gzip header, ret = %d in %s -- %s:%d --\n", ret, __FUNCTION__, __FILE__, __LINE__); fflush(stderr);
+						DEBUG_BREAK(1);
 						pz->error = 1;
 					}
 					break;
@@ -515,8 +542,9 @@ if(pgz->task == PGZF_TASK_DEFLATE){
 					pz->step = 0;
 					inflateReset(pz->z);
 					continue;
-				} else if(pz->eof){
+				} else if(pgz->eof){
 					pz->error = 2;
+					DEBUG_BREAK(1);
 					break;
 				} else {
 					memmove(pgz->src->buffer, pgz->src->buffer + pgz->soff, pgz->src->size - pgz->soff);
@@ -535,6 +563,7 @@ if(pgz->task == PGZF_TASK_DEFLATE){
 					break;
 				} else if(ret != Z_OK){
 					fprintf(stderr, " -- ZERROR: %d in %s -- %s:%d --\n", ret, __FUNCTION__, __FILE__, __LINE__); fflush(stderr);
+					DEBUG_BREAK(1);
 					pz->error = 1;
 					break;
 				}
@@ -548,9 +577,13 @@ if(pgz->task == PGZF_TASK_DEFLATE){
 							abort();
 						}
 						append_array_u1v(pz->srcs[next], pgz->src->buffer + pgz->soff, pgz->src->size - pgz->soff);
+						pgz->soff = pgz->src->size;
+					} else {
+						memmove(pgz->src->buffer, pgz->src->buffer + pgz->soff, pgz->src->size - pgz->soff);
 					}
 				}
-				pgz->soff = pgz->src->size = 0;
+				pgz->src->size -= pgz->soff;
+				pgz->soff = 0;
 				break;
 			}
 		}
@@ -569,7 +602,7 @@ if(pgz->task == PGZF_TASK_DEFLATE){
 		}
 		rsize = fread(pgz->dst->buffer + pgz->dst->size, 1, bufsize - pgz->dst->size, pz->file);
 		if(rsize < bufsize - pgz->dst->size){
-			pz->eof = 1;
+			pgz->eof = 1;
 		}
 		pgz->dst->size += rsize;
 		pz->tot_in += pgz->dst->size;
@@ -604,7 +637,6 @@ static inline PGZF* open_pgzf_writer(FILE *out, u4i buffer_size, int ncpu, int l
 	pz->file = out;
 	pz->ftype = PGZF_FILETYPE_PGZF;
 	pz->error = 0;
-	pz->eof = 0;
 	pz->verbose = 0;
 	pz->grp_status = 1;
 	pz->step = 0;
@@ -614,6 +646,7 @@ static inline PGZF* open_pgzf_writer(FILE *out, u4i buffer_size, int ncpu, int l
 	pz->grp_blocks = 8000;
 	pz->blocks[0] = init_u8v(32);
 	pz->blocks[1] = init_u8v(32);
+	pz->sels = init_u8v(8);
 	pz->z = NULL;
 	pz->dsts = calloc(pz->ncpu, sizeof(u1v*));
 	for(i=0;i<pz->ncpu;i++){
@@ -637,11 +670,13 @@ static inline PGZF* open_pgzf_writer(FILE *out, u4i buffer_size, int ncpu, int l
 	pgz->ixval = 0;
 	pgz->ixoff = 0;
 	pgz->soff = 0;
+	pgz->fileoff = 0;
 	pgz->doff = 0;
 	pgz->dst = pz->dsts[pgz->t_idx];
 	pgz->src = pz->srcs[pgz->t_idx];
 	pgz->token = 0;
 	pgz->level = level;
+	pgz->eof = 0;
 	pgz->task = PGZF_TASK_NULL;
 	pgz->has = 0;
 	pgz->blocktype = PGZF_BLOCKTYPE_NIL;
@@ -664,7 +699,6 @@ static inline int write_index_pgzf(PGZF *pz){
 	thread_wake(pgz);
 	pz->grp_status = 1;
 	pz->widx ++;
-	thread_export(pgz, pz);
 	return 1;
 }
 
@@ -697,7 +731,6 @@ static inline size_t write_pgzf(PGZF *pz, void *dat, size_t len){
 			}
 		}
 	}
-	thread_export(pgz, pz);
 	return len;
 }
 
@@ -722,7 +755,6 @@ static inline size_t write_block_pgzf(PGZF *pz, void *dat, size_t len){
 	if((pz->widx % pz->grp_blocks) == 0){
 		write_index_pgzf(pz);
 	}
-	thread_export(pgz, pz);
 	return len;
 }
 
@@ -748,7 +780,6 @@ static inline void _end_pgzf_writer(PGZF *pz){
 		}
 	}
 	write_index_pgzf(pz);
-	thread_export(pgz, pz);
 }
 
 static inline PGZF* open_pgzf_reader(FILE *in, u4i bufsize, int ncpu){
@@ -757,6 +788,10 @@ static inline PGZF* open_pgzf_reader(FILE *in, u4i bufsize, int ncpu){
 	u4i i, hoff, zcval;
 	thread_prepare(pgz);
 	pz = malloc(sizeof(PGZF));
+	if(ncpu < 1){
+		get_linux_sys_info(NULL, NULL, &ncpu);
+		if(ncpu < 1) ncpu = 8;
+	}
 	pz->ncpu = ncpu;
 	pz->ridx = 0;
 	pz->widx = 0;
@@ -771,7 +806,6 @@ static inline PGZF* open_pgzf_reader(FILE *in, u4i bufsize, int ncpu){
 	pz->file = in;
 	pz->grp_status = 1;
 	pz->grp_blocks = 0;
-	pz->eof = 0;
 	pz->error = 0;
 	pz->step = 0;
 	pz->verbose = 0;
@@ -785,6 +819,7 @@ static inline PGZF* open_pgzf_reader(FILE *in, u4i bufsize, int ncpu){
 	pz->lst_off = pz->offset;
 	pz->blocks[0] = init_u8v(32);
 	pz->blocks[1] = init_u8v(32);
+	pz->sels = init_u8v(8);
 	// recognize PGZF
 	hoff = 0;
 	pz->srcs[0] = init_u1v(1024);
@@ -843,90 +878,29 @@ static inline PGZF* open_pgzf_reader(FILE *in, u4i bufsize, int ncpu){
 	pgz->ixval = 0;
 	pgz->ixoff = 0;
 	pgz->soff = pgz->t_idx? 0 : hoff;
+	pgz->fileoff = 0;
 	pgz->doff = 0;
 	pgz->src = pz->srcs[pgz->t_idx];
 	pgz->dst = pz->dsts[pgz->t_idx];
 	pgz->level = Z_DEFAULT_COMPRESSION; // useless in inflating
+	pgz->has = 0;
+	pgz->eof = 0;
 	pgz->task = PGZF_TASK_INFLATE;
 	thread_end_init(pgz);
-	thread_beg_operate(pgz, 0);
-	thread_wake(pgz);
+	//thread_beg_operate(pgz, 0);
+	//thread_wake(pgz);
 	//thread_wake_all(pgz);
 	thread_export(pgz, pz);
 	return pz;
-}
-
-static inline size_t read_pgzf(PGZF *pz, void *dat, size_t len){
-	size_t off;
-	u4i nrun;
-	thread_prepare(pgz);
-	thread_import(pgz, pz);
-	nrun = 0;
-	for(off=0;off<len;){
-		thread_beg_operate(pgz, pz->widx % pz->ncpu);
-		thread_wait(pgz);
-		if(pz->error) break;
-		if(len - off < pgz->dst->size - pgz->doff){
-			if(dat) memcpy(dat + off, pgz->dst->buffer + pgz->doff, len - off);
-			pz->tot_out += len - off;
-			pgz->doff += len - off;
-			off = len;
-			break;
-		} else if(pgz->dst->size){
-			if(dat) memcpy(dat + off, pgz->dst->buffer + pgz->doff, pgz->dst->size - pgz->doff);
-			pz->tot_out += pgz->dst->size - pgz->doff;
-			off += pgz->dst->size - pgz->doff;
-			pgz->doff = pgz->dst->size;
-		} else if(pz->eof){
-			nrun ++;
-			if(nrun >= pz->ncpu){
-				break;
-			}
-		}
-		thread_wake(pgz);
-		pz->widx ++;
-	}
-	return off;
-}
-
-static inline size_t read_block_pgzf(PGZF *pz, u1v *dat){
-	u8i inc;
-	u4i nrun, finish;
-	thread_prepare(pgz);
-	thread_import(pgz, pz);
-	nrun = inc = finish = 0;
-	while(!finish){
-		thread_beg_operate(pgz, pz->widx % pz->ncpu);
-		thread_wait(pgz);
-		if(pz->error) break;
-		if(pgz->dst->size || pgz->has){
-			inc = pgz->dst->size - pgz->doff;
-			if(dat){
-				encap_u1v(dat, inc);
-				memcpy(dat->buffer + dat->size, pgz->dst->buffer + pgz->doff, inc);
-				dat->size += inc;
-			}
-			pz->tot_out += inc;
-			pgz->doff = pgz->dst->size;
-			finish = 1;
-		} else if(pz->eof){
-			nrun ++;
-			if(nrun >= pz->ncpu){
-				finish = 1;
-			}
-		}
-		thread_wake(pgz);
-		pz->widx ++;
-	}
-	return inc;
 }
 
 static inline void reset_pgzf_reader(PGZF *pz){
 	thread_prepare(pgz);
 	thread_import(pgz, pz);
 	thread_beg_iter(pgz);
-	pz->eof = 1;
+	pgz->eof = 2;
 	thread_wait(pgz);
+	thread_set_idle(pgz);
 	clear_u1v(pgz->src); pgz->soff = 0;
 	clear_u1v(pgz->dst);
 	pgz->zcval = 0;
@@ -937,17 +911,16 @@ static inline void reset_pgzf_reader(PGZF *pz){
 	pgz->doff = 0;
 	pgz->task = PGZF_TASK_INFLATE;
 	pgz->has = 0;
+	pgz->eof = 0;
 	thread_end_iter(pgz);
 	pz->ridx = 0;
 	pz->widx = 0;
-	pz->eof = 0;
 	pz->error = 0;
 	pz->step = 0;
 	pz->tot_in  = 0;
 	pz->tot_out = 0;
 	//thread_beg_operate(pgz, 0);
 	//thread_wake(pgz);
-	thread_export(pgz, pz);
 }
 
 static inline int load_index_pgzf(PGZF *pz){
@@ -955,7 +928,7 @@ static inline int load_index_pgzf(PGZF *pz){
 	u4i i, cnts[2];
 	thread_prepare(pgz);
 	thread_import(pgz, pz);
-	if(pz->ftype != PGZF_FILETYPE_PGZF) return 0;
+	if(pz->rw_mode != PGZF_MODE_R) return 0;
 	if(!pz->seekable) return 0;
 	if(pz->blocks[0]->size) return 1;
 	reset_pgzf_reader(pz);
@@ -968,7 +941,9 @@ static inline int load_index_pgzf(PGZF *pz){
 		fseek(pz->file, off, SEEK_SET);
 		clear_u1v(pgz->src); pgz->soff = 0;
 		_read_pgzf_header(pz->file, pgz->src, &pgz->soff, &pgz->zcval, &pgz->gcval, &pgz->ixval, &pgz->ixoff);
-		if(pgz->gcval == 0) break;
+		if(pgz->gcval == 0){
+			break;
+		}
 		off += pgz->gcval;
 		fseek(pz->file, off, SEEK_SET);
 		clear_u1v(pgz->src); pgz->soff = 0;
@@ -992,8 +967,98 @@ static inline int load_index_pgzf(PGZF *pz){
 	return (off == tot);
 }
 
+// MUST call before any read operation
+static inline int select_blocks_pgzf_reader(PGZF *pz, u8i *blks, u4i cnt){
+	if(load_index_pgzf(pz) == 0) return 0;
+	append_array_u8v(pz->sels, blks, cnt);
+	return 1;
+}
+
+static inline size_t read_pgzf(PGZF *pz, void *dat, size_t len){
+	size_t off;
+	u4i nrun;
+	thread_prepare(pgz);
+	thread_import(pgz, pz);
+	nrun = 0;
+	for(off=0;off<len;){
+		thread_beg_operate(pgz, pz->widx % pz->ncpu);
+		int state = thread_wait(pgz);
+		if(state == THREAD_STATE_IDLE){ // hasn't start
+			thread_wake(pgz);
+			state = thread_wait(pgz);
+		}
+		if(pz->verbose){
+			fflush(stdout); fprintf(stderr, " -- read: id=%d(%d,%d) tot=[%d-%d] fileoff=%llu off=%llu len=%llu --\n", pz->widx, thread_index(pgz), state, (u4i)pgz->doff, (u4i)pgz->dst->size, pgz->fileoff, (u8i)off, (u8i)len); fflush(stderr);
+		}
+		if(pz->error) break;
+		if(len - off < pgz->dst->size - pgz->doff){
+			if(dat) memcpy(dat + off, pgz->dst->buffer + pgz->doff, len - off);
+			pz->tot_out += len - off;
+			pgz->doff += len - off;
+			off = len;
+			break;
+		} else if(pgz->dst->size){
+			if(dat) memcpy(dat + off, pgz->dst->buffer + pgz->doff, pgz->dst->size - pgz->doff);
+			pz->tot_out += pgz->dst->size - pgz->doff;
+			off += pgz->dst->size - pgz->doff;
+			pgz->doff = pgz->dst->size;
+		} else if(pgz->eof){
+			nrun ++;
+			if(nrun >= pz->ncpu){
+				break;
+			}
+		}
+		thread_wake(pgz);
+		pz->widx ++;
+	}
+	return off;
+}
+
+// -1: mean EOF/ERR
+static inline ssize_t read_block_pgzf(PGZF *pz, u1v *dat){
+	u8i inc;
+	u4i nrun, finish;
+	thread_prepare(pgz);
+	thread_import(pgz, pz);
+	nrun = inc = finish = 0;
+	while(!finish){
+		thread_beg_operate(pgz, pz->widx % pz->ncpu);
+		thread_wait(pgz);
+		if(pz->error) return -1;
+		if(pgz->dst->size || pgz->has){
+			inc = pgz->dst->size - pgz->doff;
+			if(dat){
+				encap_u1v(dat, inc);
+				memcpy(dat->buffer + dat->size, pgz->dst->buffer + pgz->doff, inc);
+				dat->size += inc;
+			}
+			pz->tot_out += inc;
+			pgz->doff = pgz->dst->size;
+			finish = 1;
+		} else if(pgz->eof){
+			nrun ++;
+			if(nrun >= pz->ncpu){
+				return -1;
+			}
+		}
+		thread_wake(pgz);
+		pz->widx ++;
+	}
+	return inc;
+}
+
 static inline b8i tell_pgzf(PGZF *pz){
 	return (pz->rw_mode == PGZF_MODE_W)? pz->tot_in : pz->tot_out;
+}
+
+static inline int eof_pgzf(PGZF *pz){
+	thread_prepare(pgz);
+	thread_import(pgz, pz);
+	if(pz->error) return 1;
+	thread_beg_iter(pgz);
+	if(!pgz->eof || pgz->doff < pgz->dst->size) return 0;
+	thread_end_iter(pgz);
+	return 1;
 }
 
 static inline int seek_pgzf(PGZF *pz, b8i offset, int whence){
@@ -1040,7 +1105,6 @@ static inline int seek_pgzf(PGZF *pz, b8i offset, int whence){
 	if(uoff < offset){
 		read_pgzf(pz, NULL, offset - uoff);
 	}
-	thread_export(pgz, pz);
 	return 0;
 }
 
@@ -1066,7 +1130,6 @@ static inline int seek_block_pgzf(PGZF *pz, b8i block_idx){
 	fseek(pz->file, zoff, SEEK_SET);
 	pz->tot_in  = zoff;
 	pz->tot_out = uoff;
-	thread_export(pgz, pz);
 	return 0;
 }
 
@@ -1075,9 +1138,10 @@ static inline void close_pgzf(PGZF *pz){
 	thread_import(pgz, pz);
 	if(pz->rw_mode == PGZF_MODE_W){
 		_end_pgzf_writer(pz);
-	} else {
-		pz->eof = 1;
 	}
+	thread_beg_iter(pgz);
+	pgz->eof = 2;
+	thread_end_iter(pgz);
 	thread_beg_close(pgz);
 	free_u1v(pgz->dst);
 	free_u1v(pgz->src);
@@ -1097,6 +1161,7 @@ static inline void close_pgzf(PGZF *pz){
 	}
 	free_u8v(pz->blocks[0]);
 	free_u8v(pz->blocks[1]);
+	free_u8v(pz->sels);
 	free(pz);
 }
 
@@ -1157,18 +1222,24 @@ static inline int pgzf_io_close(void *obj){
 
 static const cookie_io_functions_t pgzf_io_funs = { pgzf_io_read, pgzf_io_write, pgzf_io_seek, pgzf_io_close };
 
-static inline FILE* fopen_pgzf_reader(FILE *in, u4i bufsize, int ncpu){
-	PGZF *pz;
-	if(bufsize == 0) bufsize = 1024 * 1024;
-	pz = open_pgzf_reader(in, bufsize, ncpu);
-	return fopencookie(pz, "r", pgzf_io_funs);
+static inline FILE* asfile_pgzf(PGZF *pz, char *rw_mode){
+	return fopencookie(pz, rw_mode, pgzf_io_funs);
 }
 
-static inline FILE* fopen_pgzf_writer(FILE *out, u4i bufsize, int ncpu, int level){
+static inline FILE* fopen_pgzf_reader(char *prefix, char *suffix, u4i bufsize, int ncpu){
 	PGZF *pz;
-	if(bufsize == 0) bufsize = 1024 * 1024;
+	FILE *in;
+	in = open_file_for_read(prefix, suffix);
+	pz = open_pgzf_reader(in, bufsize, ncpu);
+	return asfile_pgzf(pz, "r");
+}
+
+static inline FILE* fopen_pgzf_writer(char *prefix, char *suffix, u4i bufsize, int ncpu, int level){
+	PGZF *pz;
+	FILE *out;
+	out = open_file_for_write(prefix, suffix, 1);
 	pz = open_pgzf_writer(out, bufsize, ncpu, level);
-	return fopencookie(pz, "w", pgzf_io_funs);
+	return asfile_pgzf(pz, "w");
 }
 
 #endif
