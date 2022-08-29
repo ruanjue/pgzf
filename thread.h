@@ -221,28 +221,46 @@ do {	\
 
 #define thread_begin_operate(tname, idx) tname = tname##_params + idx
 #define thread_beg_operate(tname, idx) thread_begin_operate(tname, idx)
-#define thread_wake(tname)  do { pthread_mutex_lock(&(tname)->_COND_LOCK); (tname)->state = THREAD_STATE_BUSY; pthread_cond_signal(&(tname)->_COND); pthread_mutex_unlock(&(tname)->_COND_LOCK); } while(0)
+#define thread_wake(tname)	\
+	do {	\
+		pthread_mutex_lock(&(tname)->_COND_LOCK);	\
+		(tname)->state = THREAD_STATE_BUSY;	\
+		pthread_cond_signal(&(tname)->_COND);	\
+		pthread_mutex_unlock(&(tname)->_COND_LOCK);	\
+	} while(0)
 #define thread_wake_all(tname)  do { thread_beg_iter(tname); thread_wake(tname); thread_end_iter(tname); } while(0);
 #define thread_is_idle(tname) ((tname)->state == THREAD_STATE_IDLE || (tname)->state == THREAD_STATE_DONE)
 #define thread_is_done(tname) ((tname)->state == THREAD_STATE_DONE)
+#define thread_set_idle(tname) (tname)->state = THREAD_STATE_IDLE
 #define thread_wait(tname)	\
-	while(1){	\
-		int _stop;	\
-		_stop = 0;	\
-		pthread_mutex_lock(&tname->_COND_LOCK);	\
-		if(thread_is_idle(tname)) _stop = 1;	\
-		else {	\
-			struct timespec _timeout;	\
-			clock_gettime(CLOCK_REALTIME, &_timeout);	\
-			_timeout.tv_nsec += 1000;	\
-			pthread_cond_timedwait(&tname->_COND, &tname->_COND_LOCK, &_timeout);	\
+	({	\
+		int _ret;	\
+		while(1){	\
+			int _stop;	\
+			_stop = 0;	\
+			pthread_mutex_lock(&tname->_COND_LOCK);	\
 			if(thread_is_idle(tname)) _stop = 1;	\
+			else {	\
+				struct timespec _timeout;	\
+				clock_gettime(CLOCK_REALTIME, &_timeout);	\
+				_timeout.tv_nsec += 1000;	\
+				pthread_cond_timedwait(&tname->_COND, &tname->_COND_LOCK, &_timeout);	\
+				if(thread_is_idle(tname)) _stop = 1;	\
+			}	\
+			pthread_mutex_unlock(&tname->_COND_LOCK);	\
+			if(_stop) break;	\
 		}	\
-		pthread_mutex_unlock(&tname->_COND_LOCK);	\
-		if(_stop) break;	\
-	}	\
-	tname->state = THREAD_STATE_IDLE
-#define thread_wait_next(tname) do { thread_beg_operate(tname, tname##_var_next); thread_wait(tname); tname##_var_next = (tname##_var_next + 1) % tname##_params[0].n_cpu; } while(0)
+		_ret = tname->state;	\
+		_ret;	\
+	})
+#define thread_wait_next(tname)	\
+	({	\
+		int _ret;	\
+		thread_beg_operate(tname, tname##_var_next);	\
+		_ret = thread_wait(tname);	\
+		tname##_var_next = (tname##_var_next + 1) % tname##_params[0].n_cpu;	\
+		_ret;	\
+	})
 #define thread_end_operate(tname, idx)   tname = NULL
 #define thread_begin_iter(tname) { struct tname##_struct * tname = NULL; int tname##_i; for(tname##_i=0;tname##_i<tname##_params[0].n_cpu;tname##_i++){ tname = tname##_params + tname##_i
 #define thread_beg_iter(tname) thread_begin_iter(tname)
