@@ -17,11 +17,12 @@ int usage(int ret){
 	"             that is one indexed group contains 8000 * 1MB bytes original data\n"
 	" -l <int>    Compress level, 1-9, see gzip, [6]\n"
 	" -d          Decompress mode\n"
-	" -p <int>    Decompress at uncompressed position <-p>, [0]\n"
+	" -p <int>    Decompress at uncompressed position $p, [0]\n"
 	"             '-p 1000' means seek to the 1000th byte\n"
 	"             '-p -10' means seek to the 10th block\n"
-	" -q <int>    Decompess only <-q> blocks, [0]\n"
-	"             '-p -10 -q 1' means fetch the 10th block\n"
+	" -q <int>    Decompess only $q bytes, [0]\n"
+	"             '-p -10 -q -1' means fetch the 10th block\n"
+	"             '-p 10000 -q 1000' means read 10000th to 11000th bytes\n"
 	" -v          Verbose\n"
 	" -V          Print version information and exit\n"
 	" -h          Show this document\n"
@@ -41,7 +42,7 @@ int main(int argc, char **argv){
 	char *outf, *ftag;
 	FILE *in, *out;
 	u1v *buffs;
-	b8i seekoff, read_blks, limit_blks;
+	b8i seekoff, read_blks, limit_blks, read_bytes, limit_bytes;
 	u4i bufsize, nbyte, grp_blocks;
 	int c, rw, ncpu, level, overwrite, append, del, is_dir, verbose;
 	rw = PGZF_MODE_W;
@@ -54,7 +55,7 @@ int main(int argc, char **argv){
 	del = 0;
 	verbose = 0;
 	seekoff = 0;
-	read_blks = 0;
+	limit_bytes = 0;
 	limit_blks = 0;
 	outf = NULL;
 	while((c = getopt(argc, argv, "hdxfat:b:l:o:p:q:vV")) != -1){
@@ -78,7 +79,7 @@ int main(int argc, char **argv){
 			case 'x': del = 1; break;
 			case 'd': rw = PGZF_MODE_R; break;
 			case 'p': seekoff = atol(optarg); break;
-			case 'q': limit_blks = atol(optarg); break;
+			case 'q': limit_bytes = atol(optarg); break;
 			case 'v': verbose = 1; break;
 			case 'V': fprintf(stdout, "pgzf %s\n", TOSTR(VERSION)); return 0;
 			default: return usage(1);
@@ -95,6 +96,14 @@ int main(int argc, char **argv){
 			del = 0;
 		}
 	}
+	if(ncpu <= 0){
+		ncpu = 8;
+	}
+	if(limit_bytes < 0){
+		limit_blks = - limit_bytes;
+		limit_bytes = 0;
+	}
+	read_bytes = read_blks = 0;
 	is_dir = 0;
 	out = NULL;
 	if(outf){
@@ -181,13 +190,24 @@ int main(int argc, char **argv){
 				seek_block_pgzf(pz, - seekoff);
 				seekoff = 0;
 			}
-			if(limit_blks > 0){
+			if(limit_blks){
 				while(read_blks < limit_blks){
-					if(read_block_pgzf(pz, buffs) == 0 && pz->eof) break;
+					if(read_block_pgzf(pz, buffs) == -1) break;
 					fwrite(buffs->buffer, 1, buffs->size, out);
 					clear_u1v(buffs);
 					read_blks ++;
 				}
+			} else if(limit_bytes){
+				while(1){
+					nbyte = limit_bytes - read_bytes;
+					if(nbyte == 0) break;
+					nbyte = num_min(nbyte, bufsize);
+					if((nbyte = read_pgzf(pz, buffs->buffer, nbyte)) == 0){
+						break;
+					}
+					fwrite(buffs->buffer, 1, nbyte, out);
+					read_bytes += nbyte;
+				};
 			} else {
 				while((nbyte = read_pgzf(pz, buffs->buffer, buffs->cap))){
 					fwrite(buffs->buffer, 1, nbyte, out);
