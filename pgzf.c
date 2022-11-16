@@ -220,7 +220,7 @@ int main(int argc, char **argv){
 			close_pgzf(pz);
 			if(in != stdin){
 				fclose(in);
-#if 0
+#if 1
 				if(del){
 					unlink(argv[optind]);
 				}
